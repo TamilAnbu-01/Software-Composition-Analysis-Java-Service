@@ -1,336 +1,594 @@
-# SCA Scanner
-
-A Java backend service that takes a list of a project's dependencies, correlates them against
-the [GitHub Advisory Database](https://github.com/advisories) using version-matching and
-deduplication logic implemented from scratch, and recommends the minimal upgrade that resolves
-the most known vulnerabilities.
-
-This is not a wrapper around an existing SCA tool (OWASP Dependency-Check, Snyk, Trivy, ...) -
-the only thing pulled from outside is raw vulnerability *data*. Package-identity matching,
-affected-version range evaluation, deduplication, and the remediation algorithm are all
-implemented in this repository.
-
-## Quick start
-
-```bash
+SCA Scanner
+A Java backend service that takes a list of a project's dependencies, correlates them against the GitHub Advisory Database using custom version-matching, correlation, deduplication, and remediation logic, and recommends the minimum upgrade that resolves the maximum number of known vulnerabilities.
+This is not a wrapper around an existing SCA tool such as OWASP Dependency-Check, Snyk, or Trivy. The application uses an external source only for raw vulnerability intelligence. Package identity matching, affected-version evaluation, deduplication, and remediation are implemented in this repository.
+Quick Start
+Requirements
+- Java 21
+- Maven 3.8+
+- Internet access for the GitHub Advisory Database
+- Optional: GITHUB_TOKEN environment variable for a higher GitHub API rate limit
+Run the application
 mvn spring-boot:run
-```
+The service starts on:
+http://localhost:8080
+Run tests
+mvn test
+Current test result:
+Tests run: 51
+Failures: 0
+Errors: 0
+Skipped: 0
 
-```bash
-curl -X POST localhost:8080/api/v1/scans \
+BUILD SUCCESS
+Example Scan
+The primary endpoint is:
+POST /scan
+Example request:
+curl -X POST http://localhost:8080/scan \
   -H "Content-Type: application/json" \
   -d '{
-        "project": "payment-service",
-        "dependencies": [
-          {"ecosystem": "maven", "group": "org.apache.logging.log4j", "name": "log4j-core", "version": "2.14.1"}
-        ]
-      }'
-```
-
-That request, run against the live GitHub Advisory Database, returns the real Log4Shell chain
-(CVE-2021-44228, CVE-2021-45046, CVE-2021-45105, ...) and recommends `2.25.4` - the smallest
-version that clears every one of them as of the advisories currently on record. See "How this
-was tested" below for the actual output of that call.
-
-`GET /api/v1/scans/{scanId}` retrieves a previous scan. `GET /api/v1/health` is a liveness check.
-
-## Architecture
-
-```
+    "project": "payment-service",
+    "dependencies": [
+      {
+        "ecosystem": "maven",
+        "group": "org.apache.logging.log4j",
+        "name": "log4j-core",
+        "version": "2.14.1"
+      }
+    ]
+  }'
+The request is evaluated through the complete pipeline:
+normalize
+    ->
+fetch vulnerability data
+    ->
+correlate affected versions
+    ->
+deduplicate findings
+    ->
+calculate remediation
+A live test against the GitHub Advisory Database using org.apache.logging.log4j:log4j-core@2.14.1 produced 7 findings and recommended version 2.25.4, resolving all 7 findings.
+Architecture
 DependencyInput (raw JSON)
-      │
-      ▼
-DependencyNormalizer  ──►  NormalizedDependency (canonical package key + version)
-      │
-      ▼
-VulnerabilitySource (GitHubAdvisorySource)  ──►  List<VulnerabilityRecord>
-      │
-      ▼
-CorrelationEngine  ──►  List<Finding>   (installed version actually falls in an affected range)
-      │
-      ▼
-Deduplicator       ──►  List<Finding>   (same vulnerability reported under >1 identifier, merged)
-      │
-      ▼
-RemediationEngine  ──►  RemediationPlan (smallest version resolving the most findings)
-```
+        |
+        v
+DependencyNormalizer
+        |
+        v
+NormalizedDependency
+(canonical package key + version)
+        |
+        v
+VulnerabilitySource
+(GitHubAdvisorySource)
+        |
+        v
+List<VulnerabilityRecord>
+        |
+        v
+CorrelationEngine
+(installed version vs affected ranges)
+        |
+        v
+List<Finding>
+        |
+        v
+Deduplicator
+(merge duplicate/aliased vulnerabilities)
+        |
+        v
+List<Finding>
+        |
+        v
+RemediationEngine
+(minimum version resolving maximum findings)
+        |
+        v
+RemediationPlan
+ScanService orchestrates the pipeline.
+The core scanning logic is intentionally separated from Spring. The web layer is a thin REST adapter over the framework-free scanning pipeline.
+This provides two benefits:
+1. The core logic can be unit tested without starting a web server or Spring application context.
+2. Vulnerability sources and version comparators can be replaced or extended through interfaces.
+Package Layout
+Package	Responsibility
+model	Immutable domain records
+version	VersionComparator interface and ecosystem-specific comparators
+normalize	Converts raw dependency input into canonical dependencies
+intel	Vulnerability source interface and GitHub Advisory Database client
+correlate	Vulnerability range parsing and affected-version evaluation
+dedup	Merges duplicate vulnerabilities and cross-referenced aliases
+remediate	Minimum-safe-upgrade algorithm
+service	Scan orchestration and in-memory scan storage
+api	REST controller and global exception handling
+config	Spring bean configuration
 
-`ScanService` is the only class that wires these together, and it - along with everything
-above it in the diagram - **imports nothing from Spring**. The web framework is a thin adapter
-(`api/ScanController`) on top of a plain Java pipeline. Two reasons for that split:
 
-1. It's directly testable. All 45 of the tests described below run against plain objects with
-   no web server, no application context, and (except for the one live smoke-test call
-   described below) no network.
-2. It makes the "swap the data source" and "add an ecosystem" extension points real rather than
-   theoretical - `VulnerabilitySource` and `VersionComparator` are interfaces the core code
-   depends on, not concrete GitHub/Maven-specific classes.
+Data Model
+The application uses immutable Java records for its main domain objects.
+NormalizedDependency
+Represents a validated dependency after normalization.
+Important fields:
+ecosystem
+packageKey
+version
+The packageKey is ecosystem-specific.
+For Maven:
+group:artifact
+For example:
+org.apache.logging.log4j:log4j-core
+For npm, Go, and PyPI the package key is normalized according to the ecosystem-specific input shape.
+The ecosystem-specific package identity is created once by DependencyNormalizer and reused throughout the rest of the pipeline.
+VulnerabilityRecord
+Represents vulnerability intelligence independently of the external source format.
+It contains:
+id
+aliases
+summary
+severity
+ecosystem
+packageKey
+ranges
+source
+The aliases field allows identifiers such as:
+GHSA-jfh8-c2jp-5v3q
+CVE-2021-44228
+to represent the same underlying vulnerability.
+VersionRange
+Represents an affected version interval using:
+introducedInclusive
+fixedExclusive
+lastAffectedInclusive
+This supports:
+- vulnerabilities with a known fixed version
+- vulnerabilities where only the last affected version is known
+- vulnerabilities with no known upper bound
+Finding
+A finding connects:
+NormalizedDependency
++
+VulnerabilityRecord
++
+nearest known fixed version
 
-### Package layout
+RemediationPlan
+A remediation plan records:
+- current dependency version
+- recommended version
+- findings before remediation
+- findings after remediation
+- number of findings resolved
+- findings remaining
+- severity breakdown
+Normalization
+DependencyNormalizer is responsible for converting raw API input into a canonical dependency representation.
+It validates:
+- ecosystem
+- package name
+- version
+- Maven group ID
+- supported version comparator
+Invalid data is rejected rather than guessed.
+For example, a Maven dependency without a group ID produces an error instead of silently creating an invalid package identity.
+Unknown ecosystems are also rejected.
+This prevents malformed or ambiguous package identifiers from entering the correlation stage.
+Version Comparison
+Version comparison is one of the most important parts of an SCA scanner.
+Versions must not be compared as ordinary strings.
+For example:
+2.10.0 > 2.9.0
+even though lexical string comparison would produce the wrong ordering.
+Maven Version Comparator
+MavenVersionComparator is implemented from scratch without using Maven's ComparableVersion implementation or the maven-artifact dependency.
+Numeric segments are compared numerically using BigInteger.
+Examples:
+1.9 < 1.10
+2.14.1 < 2.15.0
+2.15.0 == 2.15.0
+2.16.0 > 2.15.0
+2.10.0 > 2.9.0
+The implementation also handles Maven-style qualifiers.
+The release ordering used by the implementation is:
+alpha < beta < milestone < rc < snapshot < final / ga / release < sp
+It also handles:
+1.0 == 1.0.0
+1.0.0 == 1.0.0.0
+1.0.0.RELEASE == 1.0.0
+1.0.0-GA == 1.0.0
+and mixed versions such as:
+1.0.0-alpha
+1.0.0-beta
+1.0.0-rc1
+Known Limitation
+The implementation does not reproduce every corner case of Maven's actual ComparableVersion algorithm, particularly the exact list-nesting behavior for mixed . and - separators.
+It is designed to correctly handle the version patterns relevant to this assessment and the majority of normal Maven dependency versions.
+SemVer-like Comparator
+SemverLikeComparator implements SemVer-style precedence and is used for npm.
+It is also reused as an approximation for PyPI.
+PyPI's full PEP 440 behavior is not completely modeled. In particular, features such as:
+epoch
+.postN
+.devN
+are outside the current implementation.
+This is documented as a limitation rather than silently treating those versions as fully SemVer-compatible.
+Correlation
+CorrelationEngine determines whether a vulnerability actually applies to the installed dependency version.
+The process is:
+Package identity
+      ->
+Affected version range
+      ->
+Vulnerable / not vulnerable
+The vulnerability source first identifies advisories associated with the package.
+CorrelationEngine then performs the version-aware decision itself.
+For each vulnerability, it evaluates all of its ranges.
+Introduced Version
+If:
+installed < introduced
+the vulnerability does not apply.
+Fixed Version
+fixedExclusive is treated as exclusive.
+For example:
+introducedInclusive = 2.13.0
+fixedExclusive      = 2.15.0
+means:
+2.14.1 -> vulnerable
+2.15.0 -> not vulnerable
+Last Affected Version
+lastAffectedInclusive is inclusive.
+Therefore:
+lastAffectedInclusive = 2.14.1
 
-| Package | Responsibility |
-|---|---|
-| `model` | Immutable domain records - no logic, no framework annotations |
-| `version` | `VersionComparator` interface + Maven and SemVer implementations |
-| `normalize` | Turns raw input into a `NormalizedDependency`, or rejects it clearly |
-| `intel` | `VulnerabilitySource` interface + the GitHub Advisory Database client |
-| `correlate` | Range parsing + installed-version-vs-range evaluation |
-| `dedup` | Merges findings that are the same vulnerability under different identifiers |
-| `remediate` | The minimal-safe-upgrade algorithm, and a bonus cross-dependency ranker |
-| `service` | Orchestration (`ScanService`) + in-memory result store (`ScanStore`) |
-| `api` | Spring REST controller + a global exception handler |
-| `config` | Wires the framework-free core as Spring beans |
+means:
+2.14.1 -> vulnerable
+2.14.2 -> not vulnerable
 
-## Data model
+Open-ended Vulnerabilities
+If there is no upper bound, the dependency is considered vulnerable from the introduction version onward, because the source has not provided a known fix.
+Multiple Vulnerabilities
+A dependency may have several vulnerabilities.
+For example:
+log4j-core 2.14.1
 
-Everything is an immutable Java `record`. A few decisions worth calling out:
+can have multiple advisories with different fixed versions.
+Each applicable vulnerability becomes a separate Finding.
+The remediation engine then considers the complete set of findings for that dependency.
+Deduplication
+The same underlying vulnerability may appear under multiple identifiers or from multiple sources.
+For example:
+GHSA-jfh8-c2jp-5v3q
+CVE-2021-44228
 
-- **`NormalizedDependency.packageKey`** is ecosystem-shaped, not a raw string pair: Maven gets
-  `group:artifact` (matching how the GitHub Advisory Database itself names Maven packages),
-  npm/Go get `scope/name`, PyPI is flat. This is the one place ecosystem-specific coordinate
-  assembly happens - everything downstream just sees a `packageKey` string.
-- **`VersionRange`** models three independent bounds (`introducedInclusive`,
-  `fixedExclusive`, `lastAffectedInclusive`) rather than a single "affected version string",
-  because real advisory data needs all three: most ranges have a clean fix version, some only
-  know the last bad version, and a still-unpatched 0-day has no upper bound at all.
-- **`VulnerabilityRecord.aliases`** exists specifically so the deduplicator has something to
-  union over - a GHSA id and its cross-referenced CVE id are both first-class identifiers, not
-  "one canonical id plus a display string".
-- **`ScanError`** (not an exception) is how a per-dependency failure is represented in a
-  response. A malformed request throws (see the API section); a *particular dependency* being
-  unparseable, or a *particular package* failing to look up, does not - see "Error handling".
+may refer to the same vulnerability.
+Deduplicator uses vulnerability identifiers and aliases to merge equivalent findings.
+The implementation supports:
+- exact duplicate IDs
+- cross-referenced aliases
+- transitive identifier relationships
+- severity preservation
+- range union
+- CVE preference for the display identifier
+When vulnerabilities are merged, the higher severity is retained.
+Unrelated vulnerabilities are not merged.
+Remediation
+RemediationEngine determines the smallest candidate version that achieves the maximum possible number of resolved findings.
+It does not simply recommend the latest version.
+For each finding with a known fixed version, candidate versions are evaluated based on how many findings they resolve.
+The algorithm:
+1. Collect distinct known fixed versions.
+2. Evaluate each candidate against all findings.
+3. Count how many findings each candidate resolves.
+4. Find the maximum achievable resolution count.
+5. Among candidates reaching that maximum, choose the smallest version.
 
-## Normalization (`DependencyNormalizer`)
+This satisfies the requirement to minimize the recommended upgrade while still resolving the maximum number of known vulnerabilities.
+Example
+Suppose a dependency has:
+Vulnerability A -> fixed in 1.0
+Vulnerability B -> fixed in 1.1
+Vulnerability C -> fixed in 1.5
 
-Validates ecosystem, name, version, and group (required for Maven, optional/ignored elsewhere),
-then builds the canonical `packageKey`. Rejects rather than guesses: an unrecognized ecosystem
-string becomes a `ScanError`, not a silent `UNKNOWN` that quietly matches nothing further down
-the pipeline.
+The recommended version is:
+1.5
 
-## Version comparison
+because it is the smallest candidate that resolves all three findings.
+If no single candidate resolves every vulnerability, the engine performs partial remediation and reports the unresolved findings.
+A finding with no known fixed version can never be resolved by a version recommendation and remains in the remaining set.
+Vulnerability Data Source
+The application currently uses the public GitHub Advisory Database.
+GitHubAdvisorySource queries the GitHub Advisory API for the dependency ecosystem and package.
+The application deliberately does not ask the external service to decide whether the installed version is vulnerable.
+Instead:
+GitHub
+  ->
+raw advisory information
+  ->
+our VulnerabilityRecord model
+  ->
+our CorrelationEngine
 
-This is the part the assignment weights highest, and the part most SCA tools get subtly wrong
-by treating versions as strings. `1.9` must be less than `1.10` even though it isn't lexically.
+This keeps affected-version evaluation inside the application.
+The VulnerabilitySource interface also makes it possible to add additional sources later, such as:
+- OSV
+- NVD
+- private security feeds
+- local advisory databases
+The existing deduplication layer can then merge overlapping vulnerability records from different sources.
+GitHub API Rate Limits
+Unauthenticated GitHub API requests have a limited rate allowance.
+A GITHUB_TOKEN environment variable can be supplied to increase the available GitHub API limit.
+Example on Windows PowerShell:
+$env:GITHUB_TOKEN="your-token"
 
-**`MavenVersionComparator`** (written from scratch, no `maven-artifact` dependency) tokenizes a
-version into an alternating sequence of numeric and qualifier tokens - `.`, `-`, `_`, `+` are
-all treated as separators, and a digit-run/letter-run boundary is itself a separator, so
-`2.15.0-beta1` becomes `[2, 15, 0, beta, 1]`. Comparison rules:
+Example on Linux/macOS:
+export GITHUB_TOKEN="your-token"
 
-- Numbers compare numerically (`BigInteger`, so no overflow, and no `"1.10" < "1.9"` bug).
-- Qualifiers compare by release-cycle rank: `alpha < beta < milestone < rc < snapshot <
-  (final/ga/release) < sp`. An unrecognized qualifier ranks just above "final" (like a vendor
-  patch suffix) and falls back to case-insensitive string comparison against another
-  unrecognized qualifier at the same rank, so the ordering stays total even where it isn't
-  meaningful.
-- A number always outranks a qualifier at the same position (Maven's own rule -
-  `"1.0.5" > "1.0-beta"`).
-- If one version runs out of tokens first, the *other* side's next token decides: an implicit
-  numeric `0` if it's a number (`"1.0" == "1.0.0"`), or an implicit "final release" if it's a
-  qualifier - meaning `"1.0" > "1.0-beta"` but `"1.0" < "1.0-sp1"`, and `"1.0.0.RELEASE" ==
-  "1.0.0"`.
+The token is only used to authenticate requests to GitHub.
+If GitHub returns a rate-limit response, the application records a clear per-dependency error rather than crashing the entire scan.
+API
+1. Scan Dependencies
+POST /scan
 
-**Known limitation:** this does not reproduce every corner of Maven's real `ComparableVersion`
-algorithm (in particular its exact list-nesting rules when `.` and `-` are mixed). It's correct
-for the overwhelming majority of real-world versions and for every example in the assignment
-brief - see `MavenVersionComparatorTest` for the 11 cases it's checked against, including the
-full log4j chain (`2.14.1 < 2.15.0 < 2.16.0 < 2.17.0`) and qualifier ordering.
-
-**`SemverLikeComparator`** (bonus) implements SemVer 2.0.0 precedence for npm, and is reused
-as an approximation for PyPI - PEP 440's epoch/`.postN`/`.devN` segments aren't modeled, which
-is called out as a limitation rather than silently mishandled.
-
-Adding a third ecosystem is: implement `VersionComparator`, register it in
-`VersionComparators`, teach `DependencyNormalizer` its package-key shape, and add
-`Ecosystem.githubEcosystemName()`'s mapping if it should also pull from GitHub Advisories.
-Nothing else changes.
-
-## Correlation (`CorrelationEngine` + `RangeParser`)
-
-`RangeParser` turns a constraint string like `">= 2.21.0, < 2.25.4"` into a `VersionRange`.
-Constraints within one string AND together (they describe a single interval); a package with
-several *disjoint* vulnerable intervals (log4j's `2.x` line and `3.0.0-beta` line under the
-same advisory is a real example, captured live below) gets one `VersionRange` per interval,
-OR'd together at the `VulnerabilityRecord` level. Unrecognized operator text is skipped rather
-than failing the advisory - see "Error handling".
-
-`CorrelationEngine` then checks, per candidate vulnerability, whether the installed version
-falls in *any* of its ranges, using the ecosystem's real comparator (never lexical comparison).
-Verified against the assignment's own log4j-core `2.14.1` example (finds both the CRITICAL and
-HIGH CVE), plus boundary cases: installed exactly at a fix version is not vulnerable
-(`fixedExclusive` is exclusive), installed exactly at a `lastAffectedInclusive` boundary is
-still vulnerable (inclusive), and an open-ended range with no upper bound at all is treated as
-vulnerable from its lower bound onward - what an unpatched 0-day actually looks like.
-
-## Deduplication (`Deduplicator`)
-
-The GitHub Advisory Database already gives a GHSA id and its CVE id together on one advisory,
-so a single query naturally produces records with more than one identifier. The deduplicator
-generalizes this with union-find over identifier sets: any two records sharing *any* id (in
-`id` or `aliases`) are the same vulnerability, transitively - `A` and `C` merge even if they
-only share an id through `B`, not directly with each other.
-
-Merging keeps the **higher** severity of the two (a source under-reporting severity shouldn't
-suppress a real risk), the union of both records' ranges, and prefers a CVE id as the
-display id when one is present in the merged group. Verified with exact-duplicate records,
-cross-referenced-alias records, and a check that genuinely unrelated CVEs are *not* merged.
-
-## Remediation (`RemediationEngine`)
-
-The algorithm, and why it's correct:
-
-> For a fixed set of findings, "number of findings resolved by upgrading to version *V*" is
-> monotonically non-decreasing as *V* increases - a finding is resolved by any version at or
-> above its own known fix version, and "at or above" only gets easier to satisfy as *V* grows.
-> That means the **maximum** achievable resolution count is always reached by the *largest*
-> known fix version among the findings. The only open question is the assignment's actual ask -
-> the **minimum** version that still reaches that maximum - so: score every distinct known fix
-> version by how many findings it resolves, take the global maximum, and recommend the smallest
-> candidate that reaches it.
-
-Findings with no known fixed version (an advisory with no patch yet) can never be resolved by
-any recommendation and always land in `remaining`, regardless of which candidate is chosen.
-
-Verified against the assignment's own worked example - CRITICAL fixed in `2.15.0`, HIGH in
-`2.16.0`, MEDIUM+LOW in `2.17.0`, recommends `2.17.0`, resolves 4/4 - plus a case
-specifically checking that a *smaller* version is preferred when it already reaches the same
-maximum as a larger one, and a case with an unfixable finding staying in `remaining` no matter
-what's recommended.
-
-**Bonus - `RemediationPriorityRanker`:** given remediation plans for several dependencies,
-ranks them by a severity-weighted resolved-finding score (CRITICAL counts 10x, HIGH 5x, MEDIUM
-2x, LOW/UNKNOWN 1x), so "fixes 2 CRITICALs" outranks "fixes 5 LOWs" in a prioritized backlog -
-matching how a security team actually triages upgrades.
-
-## Vulnerability data source
-
-`GitHubAdvisorySource` queries `GET api.github.com/advisories?ecosystem=...&affects=...` with
-`java.net.http.HttpClient` - no HTTP client framework dependency. It deliberately does **not**
-use a version-aware query: it fetches every advisory GitHub has recorded for the package,
-unfiltered by version, and hands all of it to `CorrelationEngine`. Asking the source to also
-decide "is this version affected" would just be delegating the part of the assignment that
-matters back to a third party.
-
-Unauthenticated requests are capped at 60/hour per IP by GitHub. Setting a `GITHUB_TOKEN`
-environment variable (no scopes needed - advisory data is public) raises that to 5,000/hour.
-A 403/429 from GitHub is surfaced as a clear per-dependency error naming this, rather than a
-generic failure.
-
-`VulnerabilitySource` is an interface specifically so a second or third source (OSV, a
-downloaded NVD mirror, a private feed) could be added and fanned out to, with the existing
-`Deduplicator` already positioned to merge their overlapping results - see "Known limitations"
-for why that isn't done in this submission.
-
-## API
-
-| Method | Path | |
-|---|---|---|
-| `POST` | `/api/v1/scans` | Body: `{"project": "...", "dependencies": [{"ecosystem","group","name","version"}]}`. Returns `201` with the full `ScanResult` (see below), **even if some dependencies had errors** - see "Error handling". |
-| `GET` | `/api/v1/scans/{scanId}` | Retrieves a previous result (in-memory store), or `404`. |
-| `GET` | `/api/v1/health` | Liveness check. |
-
-`ScanResult` shape:
-```json
+Request
 {
-  "scanId": "…",
   "project": "payment-service",
-  "scannedAt": "2026-09-13T...Z",
-  "findings": [ { "dependency": {...}, "vulnerability": {...}, "fixedVersion": "2.15.0" } ],
-  "remediations": [ { "dependency": {...}, "currentVersion": "2.14.1", "recommendedVersion": "2.17.0",
-                       "findingsBefore": 4, "findingsAfter": 0, "resolved": 4, "remaining": 0,
-                       "severityResolved": {...}, "severityRemaining": {...} } ],
-  "errors": [ { "dependency": "bad-lib@1.0", "reason": "unrecognized ecosystem 'cargo'" } ]
+  "dependencies": [
+    {
+      "ecosystem": "maven",
+      "group": "org.apache.logging.log4j",
+      "name": "log4j-core",
+      "version": "2.14.1"
+    }
+  ]
 }
-```
 
-## Error handling
+Response
+Returns:
+201 Created
 
-| Situation | Behavior |
-|---|---|
-| Malformed request JSON, or missing/blank `project` | `400`, via `GlobalExceptionHandler` |
-| One dependency entry missing a name/version/required group | That entry -> `ScanError`; rest of the scan still runs |
-| Unrecognized ecosystem on one entry | Same - `ScanError`, not a crash or a silent `UNKNOWN` |
-| Vulnerability source unreachable / rate-limited for one package | `ScanError` naming the cause (incl. the `GITHUB_TOKEN` hint on rate limit); other dependencies in the same request are unaffected |
-| Unparseable advisory range syntax | That one range is skipped (open-range fallback favors over-reporting a finding over silently dropping it); the rest of the advisory and the rest of the scan proceed |
-| Empty dependency list | Valid, clean `200`/`201` result with empty arrays |
-| Any other unexpected exception | `500`, generic message, no stack trace leaked to the client |
+Example shape:
+{
+  "scanId": "6a5c4fed-2aa1-4826-9d15-3d0f7f69ce69",
+  "project": "payment-service",
+  "scannedAt": "2026-09-14T...",
+  "findings": [
+    {
+      "dependency": {},
+      "vulnerability": {},
+      "fixedVersion": "2.15.0"
+    }
+  ],
+  "remediations": [
+    {
+      "dependency": {},
+      "currentVersion": "2.14.1",
+      "recommendedVersion": "2.25.4",
+      "findingsBefore": 7,
+      "findingsAfter": 0,
+      "resolved": 7,
+      "remaining": 0,
+      "severityResolved": {},
+      "severityRemaining": {}
+    }
+  ],
+  "errors": []
+}
+A scan can still return 201 Created when individual dependencies fail.
+Those dependency-specific failures are reported in errors[] while the remaining dependencies continue to be scanned.
+2. Get Vulnerability
+GET /vulnerabilities/{id}
+Returns vulnerability information previously loaded into the local in-memory vulnerability store during a scan.
+Example:
+GET /vulnerabilities/CVE-2021-44228
+A successful response contains the vulnerability's:
+- ID
+- aliases
+- summary
+- severity
+- ecosystem
+- package key
+- affected ranges
+- source
+Both the primary vulnerability ID and its aliases can be used for lookup.
+For example, a record with:
+id = GHSA-jfh8-c2jp-5v3q
+alias = CVE-2021-44228
+can be retrieved using either identifier.
+If the vulnerability is not known to the current application instance:
+404 Not Found
+3. Get Scan Result — Bonus
+GET /scans/{scanId}
+Retrieves a previously created scan result.
+Example:
+GET /scans/6a5c4fed-2aa1-4826-9d15-3d0f7f69ce69
+Returns 200 OK when the scan exists.
+Otherwise:
+404 Not Found
+The current implementation uses an in-memory ScanStore, so scan results are available only while the application instance is running.
+4. Health Check
+GET /health
+Returns:
+{
+  "status": "UP"
+}
+Error Handling
+The application distinguishes between request-level errors and dependency-level errors.
+Situation	Behavior
+Malformed JSON	400 Bad Request
+Missing/invalid request fields	400 Bad Request
+Missing dependency name	Dependency becomes a ScanError
+Missing dependency version	Dependency becomes a ScanError
+Missing Maven group	Dependency becomes a ScanError
+Unknown ecosystem	Dependency becomes a ScanError
+Vulnerability source unavailable	Dependency becomes a ScanError
+GitHub API rate limited	Dependency becomes a ScanError
+Unknown vulnerability ID	404 Not Found
+Unknown scan ID	404 Not Found
+Empty dependency list	Valid clean scan
+Unexpected server exception	500 Internal Server Error
 
-The guiding principle: a request-level problem (bad JSON) is a client error worth failing
-loudly on; a single-dependency-level problem should never take an entire batch scan down.
 
-## How this was tested
+The guiding principle is:
+Request-level problems -> reject the request clearly
 
-45 JUnit 5 tests across the framework-free core, all passing, run in this development
-environment with the real JUnit 5 platform (not just hand-rolled assertions):
+Dependency-level problems -> isolate the failure and continue scanning
+This prevents one malformed dependency or unavailable package lookup from destroying an entire batch scan.
+Testing
+The project currently contains 51 automated tests.
+Latest result:
+Tests run: 51
+Failures: 0
+Errors: 0
+Skipped: 0
 
-| Class | Tests | Covers |
-|---|---|---|
-| `MavenVersionComparatorTest` | 11 | Numeric ordering, all qualifier ranks, missing-segment padding, the brief's own examples |
-| `CorrelationEngineTest` | 7 | The brief's log4j example, range boundary conditions, multi-range records |
-| `DeduplicatorTest` | 5 | Exact duplicates, cross-referenced aliases, severity conservatism, non-merging of unrelated CVEs |
-| `RemediationEngineTest` | 7 | The brief's worked example, minimal-vs-maximal candidate selection, unfixable findings |
-| `DependencyNormalizerTest` | 9 | Per-ecosystem key building, required-field validation |
-| `ScanServiceTest` | 6 | End-to-end orchestration against a fake source; error isolation for bad input and source failures |
+BUILD SUCCESS
+Test Coverage
+Test Class	Tests	Coverage
+ScanControllerTest	6	REST endpoints, status codes, response shapes
+CorrelationEngineTest	7	Version ranges, boundaries, multiple ranges
+DeduplicatorTest	5	Duplicate IDs, aliases, severity, unrelated CVEs
+DependencyNormalizerTest	9	Package identity and validation
+RemediationEngineTest	7	Minimum safe version and partial remediation
+ScanServiceTest	6	Pipeline orchestration and error isolation
+MavenVersionComparatorTest	11	Numeric ordering and qualifier handling
+Total	51	All passing
 
-Beyond unit tests, the full pipeline (normalize -> real `GitHubAdvisorySource` call -> correlate
--> dedup -> remediate) was run once against the **live** GitHub Advisory Database for
-`org.apache.logging.log4j:log4j-core@2.14.1`. It correctly identified the real Log4Shell chain
-and recommended the version that clears all of it:
 
-```
-Findings for 2.14.1: 7
-  - GHSA-jfh8-c2jp-5v3q  aliases=[CVE-2021-44228]  CRITICAL  nearestFix=2.15.0
-  - GHSA-7rjr-3q55-vv33  aliases=[CVE-2021-45046]  CRITICAL  nearestFix=2.16.0
-  - GHSA-p6xc-xr62-6r2g  aliases=[CVE-2021-45105]  HIGH      nearestFix=2.17.0
-  - GHSA-8489-44mv-ggj8  aliases=[CVE-2021-44832]  MEDIUM    nearestFix=2.17.1
-  ...
-Recommended upgrade: 2.25.4   (resolves 7/7)
-```
+Important Version Tests
+The test suite explicitly checks the assessment examples:
+2.14.1 < 2.15.0
+2.15.0 == 2.15.0
+2.16.0 > 2.15.0
+2.10.0 > 2.9.0
+It also tests:
+1.0 == 1.0.0
+1.0.0 == 1.0.0.RELEASE
+1.0.0 == 1.0.0-GA
+alpha < beta < milestone < rc < final
+SNAPSHOT < final
+final < SP
+Live API Verification
+The complete pipeline was also exercised against the live GitHub Advisory Database.
+Dependency:
+org.apache.logging.log4j:log4j-core@2.14.1
+Observed result:
+Findings: 7
+Recommended upgrade: 2.25.4
+Resolved: 7/7
+Remaining: 0
+Errors: 0
+Representative findings included:
+GHSA-jfh8-c2jp-5v3q
+CVE-2021-44228
+CRITICAL
+nearestFix = 2.15.0
+GHSA-7rjr-3q55-vv33
+CVE-2021-45046
+CRITICAL
+nearestFix = 2.16.0
+GHSA-p6xc-xr62-6r2g
+CVE-2021-45105
+HIGH
+nearestFix = 2.17.0
+The remediation engine ultimately recommended:
+2.25.4
+which resolved all 7 findings observed during the live test.
+Security Considerations
+This project is an assessment implementation rather than a production-ready security platform.
+Important security considerations include:
+- Vulnerability data comes from an external service and should be treated as untrusted input.
+- Advisory parsing is separated from correlation logic.
+- Request validation prevents missing package identity information from silently entering the scanner.
+- The GitHub token is read from an environment variable rather than being hard-coded.
+- Internal exception details are not returned directly to API clients.
+- The application does not execute dependency code.
+- Vulnerability data is not blindly trusted to determine whether an installed version is vulnerable; affected-version evaluation is performed by the application's own correlation logic.
+Known Limitations
+Single Vulnerability Source
+Only the GitHub Advisory Database is currently connected.
+The VulnerabilitySource abstraction allows additional sources to be added later.
+No Transitive Dependency Resolution
+The API accepts a flat dependency list.
+It does not currently resolve a Maven/npm/etc. dependency tree.
+A production implementation would need to preserve dependency paths so that a vulnerable transitive dependency can be traced back to the dependency that introduced it.
+PyPI Version Handling
+PyPI versions currently use the SemVer-like comparator as an approximation.
+PEP 440 features such as:
+epoch
+.postN
+.devN
 
-**One test file, `ScanControllerTest`, was not run.** It needs `spring-test` + Mockito
-(pulled in via `spring-boot-starter-test`), and this project was built in a sandboxed
-environment without access to Maven Central, so those jars couldn't be fetched. Everything
-else - all 45 tests above, plus the live smoke test - ran against real JUnit 5 and a real HTTP
-call, installed via the OS package manager and Java's built-in `HttpClient`, specifically so
-the important logic wasn't just eyeballed. `ScanControllerTest` follows the standard
-MockMvc-standalone + Mockito pattern; run `mvn test` after cloning to confirm it.
-
-## Known limitations / what a v2 would add
-
-- **Single vulnerability source.** Only the GitHub Advisory Database is queried.
-  `VulnerabilitySource` is an interface specifically so OSV or a downloaded NVD feed could be
-  added as a second implementation, fanned out to alongside GitHub, with `Deduplicator`
-  already able to merge their overlapping results - just not wired up in this submission.
-- **No transitive dependency resolution.** The input is a flat list; a real project's build
-  produces a dependency *tree*, and a vulnerable transitive dependency needs a path back to
-  the direct dependency that pulled it in for the remediation advice to be actionable. Adding
-  this means accepting a tree (or a build-tool-specific format like a Maven `dependency:tree`
-  output) instead of a flat list, and carrying a path alongside each `Finding`.
-- **PyPI version handling is an approximation.** PEP 440 (`epoch!`, `.postN`, `.devN`) isn't
-  fully modeled by `SemverLikeComparator` - see the version-comparison section above.
-- **In-memory result store.** `ScanStore` doesn't survive a restart or scale across instances -
-  swapping it for a real database is isolated to that one class.
-- **GitHub's unauthenticated rate limit (60/hour)** makes this unsuitable for scanning large
-  dependency trees without a `GITHUB_TOKEN`. Even with one, one HTTP call per unique package is
-  made with no caching between scans of the same project - an obvious next optimization.
-
-## Scaling this to many dependencies / repositories
-
-- **Cache advisory lookups.** Advisories change infrequently; caching `packageKey ->
-  List<VulnerabilityRecord>` (with a TTL, or invalidated by GitHub's `updated_at` field) would
-  cut redundant calls to near zero for repeated scans of similar dependency sets, and is the
-  single highest-leverage change for both latency and staying under GitHub's rate limit.
-- **Fan out per-dependency lookups concurrently** (e.g. via `CompletableFuture`/a bounded
-  executor) instead of the current sequential loop in `ScanService` - each dependency's fetch
-  is independent, so wall-clock time for a large manifest is currently the sum of every HTTP
-  call rather than the slowest one.
-- **Move `ScanStore` to a real database** once results need to survive a restart or be shared
-  across instances; the interface (`save`/`get`) doesn't need to change.
-- **Pull a full advisory dataset locally on a schedule** (GitHub, OSV, and NVD all publish bulk
-  exports) instead of querying per-package-per-scan, once request volume makes that cheaper
-  than live API calls - this is the same normalize/correlate/dedup/remediate pipeline either
-  way, only `VulnerabilitySource`'s implementation would change.
-
-## Requirements
-
-Java 21, Maven 3.8+. `mvn spring-boot:run` to start on `:8080`, `mvn test` to run the suite.
+are not fully modeled.
+In-Memory Scan Store
+ScanStore currently uses an in-memory map.
+Therefore:
+- results disappear when the application restarts
+- results are not shared across multiple application instances
+- it is not suitable for durable production storage
+A database-backed implementation would be the natural next step.
+GitHub API Rate Limits
+Without authentication, GitHub API requests are rate limited.
+A GITHUB_TOKEN can be supplied for a higher limit.
+The current implementation also makes an HTTP request for each unique dependency package and does not persist an advisory cache between scans.
+Scalability and Reliability
+Several improvements would be appropriate for a production implementation.
+Advisory Caching
+Cache:
+packageKey -> List<VulnerabilityRecord>
+with an appropriate TTL.
+This would reduce repeated calls for the same package and improve both latency and API-rate usage.
+Concurrent Dependency Lookups
+The current scan processes dependencies sequentially.
+For a large dependency manifest, independent vulnerability lookups could be performed concurrently using a bounded executor or CompletableFuture.
+This would reduce total wall-clock scan time.
+Persistent Storage
+Replace the in-memory ScanStore with a database once scan results need to survive restarts or be shared between service instances.
+The storage responsibility is isolated behind the service layer, making this change localized.
+Local Advisory Dataset
+At higher request volumes, a periodically refreshed local vulnerability dataset could replace per-package live API calls.
+The rest of the pipeline could remain unchanged:
+normalize
+    ->
+correlate
+    ->
+dedup
+    ->
+remediate
+Only the VulnerabilitySource implementation would change.
+Extensibility
+Adding another ecosystem requires:
+1. Implementing a VersionComparator.
+2. Registering it with VersionComparators.
+3. Teaching DependencyNormalizer how to construct its package key.
+4. Adding the ecosystem's GitHub Advisory mapping if GitHub advisory lookup is supported.
+5. Adding tests for the ecosystem's version semantics.
+The correlation, deduplication, remediation, and REST layers do not need to be rewritten.
+Project Requirements
+Java 21
+Maven 3.8+
+Spring Boot
+JUnit 5
+Start the application:
+mvn spring-boot:run
+Run the tests:
+mvn test
+Default server port:
+8080
+Assessment Coverage
+The implementation addresses the main assessment areas:
+- Java/Spring backend
+- Dependency normalization
+- Package identity matching
+- Custom vulnerability correlation
+- Non-lexical version comparison
+- Multiple vulnerabilities per dependency
+- Deduplication and aliases
+- Minimum safe-version remediation
+- Partial remediation
+- Error isolation
+- REST API
+- Automated testing
+- Bonus scan persistence endpoint
+- Security reasoning
+- Scalability and reliability considerations
+The implementation intentionally focuses on correctness of package identity, version semantics, vulnerability correlation, deduplication, remediation, API behavior, and testability rather than attempting to reproduce a complete production SCA platform.

@@ -13,43 +13,63 @@ import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
- * Turns request-shape problems into a clear 400 instead of a 500 with a raw stack trace.
+ * Turns request-shape problems into clear 400 responses instead of raw stack traces.
  *
- * Per-dependency data problems (bad ecosystem, missing version, an unreachable vulnerability
- * source for one package) are deliberately NOT handled here - those are caught inside
- * ScanService and reported as {@code errors[]} in an otherwise-successful 201 response, so one
- * bad dependency in a batch never fails the whole request. This handler only covers the
- * request envelope itself being malformed: unparseable JSON, or a missing/blank top-level
- * field like "project".
+ * Per-dependency data problems are handled inside ScanService and reported
+ * in the errors[] section of the scan response.
  */
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ResponseEntity<Map<String, Object>> handleValidation(MethodArgumentNotValidException ex) {
-        String detail = ex.getBindingResult().getFieldErrors().stream()
+    public ResponseEntity<Map<String, Object>> handleValidation(
+            MethodArgumentNotValidException ex) {
+
+        String detail = ex.getBindingResult()
+                .getFieldErrors()
+                .stream()
                 .map(fe -> fe.getField() + ": " + fe.getDefaultMessage())
                 .collect(Collectors.joining("; "));
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(errorBody("invalid_request", detail));
+
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(errorBody("invalid_request", detail));
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)
-    public ResponseEntity<Map<String, Object>> handleUnreadable(HttpMessageNotReadableException ex) {
-        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(errorBody("malformed_body",
-                "request body is not valid JSON matching the expected shape"));
+    public ResponseEntity<Map<String, Object>> handleUnreadable(
+            HttpMessageNotReadableException ex) {
+
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(errorBody(
+                        "malformed_body",
+                        "request body is not valid JSON matching the expected shape"
+                ));
     }
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, Object>> handleUnexpected(Exception ex) {
-        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(errorBody("internal_error",
-                "an unexpected error occurred while processing the request"));
+
+        // Temporarily print the real exception so we can identify
+        // why the vulnerability lookup is returning HTTP 500.
+
+        return ResponseEntity
+                .status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(errorBody(
+                        "internal_error",
+                        "an unexpected error occurred while processing the request"
+                ));
     }
 
     private Map<String, Object> errorBody(String error, String message) {
+
         Map<String, Object> body = new LinkedHashMap<>();
+
         body.put("timestamp", Instant.now().toString());
         body.put("error", error);
         body.put("message", message);
+
         return body;
     }
 }
