@@ -5,3 +5,7 @@ target/
 .vscode/
 .DS_Store
 *.log
+.metadata/
+.classpath
+.project
+.settings/
